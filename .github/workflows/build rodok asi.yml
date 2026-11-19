@@ -8,18 +8,61 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      PLUGIN_SDK_DIR: ${{ github.workspace }}\plugin-sdk
+
     steps:
-      - name: Ambil kode
+      - name: Ambil kode proyek kita
         uses: actions/checkout@v4
 
-      - name: Configure (32-bit / Win32)
+      - name: Ambil Plugin SDK
+        uses: actions/checkout@v4
+        with:
+          repository: DK22Pac/plugin-sdk
+          path: plugin-sdk
+
+      - name: Pasang premake5
+        uses: Jarod42/install-premake5@v7
+
+      - name: Pasang msbuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Generate project Plugin SDK (premake)
+        working-directory: plugin-sdk
+        run: premake5 vs2022 --file=tools/premake/premake5.lua
+
+      - name: Cari project plugin_sa
+        shell: pwsh
+        run: |
+          $p = Get-ChildItem -Path $env:PLUGIN_SDK_DIR -Recurse -Filter "plugin.vcxproj" |
+               Where-Object { $_.FullName -match "plugin_sa" } | Select-Object -First 1
+          if (-not $p) {
+            Write-Host "Daftar semua .vcxproj yang dihasilkan premake:"
+            Get-ChildItem -Path $env:PLUGIN_SDK_DIR -Recurse -Filter *.vcxproj | ForEach-Object { $_.FullName }
+            throw "plugin.vcxproj untuk plugin_sa tidak ditemukan"
+          }
+          Write-Host "Ditemukan: $($p.FullName)"
+          "SA_PROJ=$($p.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build plugin.lib (Plugin SDK, Release Win32)
+        shell: pwsh
+        run: msbuild "$env:SA_PROJ" /p:Configuration=Release /p:Platform=Win32 /m
+
+      - name: Pastikan plugin.lib ada
+        shell: pwsh
+        run: |
+          $lib = Join-Path $env:PLUGIN_SDK_DIR "output\lib\plugin.lib"
+          if (-not (Test-Path $lib)) {
+            Get-ChildItem -Path $env:PLUGIN_SDK_DIR -Recurse -Filter *.lib | ForEach-Object { $_.FullName }
+            throw "plugin.lib tidak ditemukan di $lib"
+          }
+          Write-Host "OK: $lib"
+
+      - name: Configure plugin kita (32-bit)
         run: cmake -S . -B build -A Win32
 
-      - name: Build (Release)
+      - name: Build plugin kita (Release)
         run: cmake --build build --config Release
-
-      - name: Tampilkan hasil build
-        run: dir build\Release
 
       - name: Upload hasil (.asi)
         uses: actions/upload-artifact@v4
