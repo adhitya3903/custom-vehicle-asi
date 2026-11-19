@@ -1,0 +1,29 @@
+name: Build ASI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Ambil kode
+        uses: actions/checkout@v4
+
+      - name: Configure (32-bit / Win32)
+        run: cmake -S . -B build -A Win32
+
+      - name: Build (Release)
+        run: cmake --build build --config Release
+
+      - name: Tampilkan hasil build
+        run: dir build\Release
+
+      - name: Upload hasil (.asi)
+        uses: actions/upload-artifact@v4
+        with:
+          name: CustomVehicles-asi
+          path: build/Release/CustomVehicles.asi
+          if-no-files-found: error
