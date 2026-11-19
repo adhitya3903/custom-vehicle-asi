@@ -34,8 +34,8 @@ jobs:
       - name: Cari project plugin_sa
         shell: pwsh
         run: |
-          $p = Get-ChildItem -Path $env:PLUGIN_SDK_DIR -Recurse -Filter "plugin.vcxproj" |
-               Where-Object { $_.FullName -match "plugin_sa" } | Select-Object -First 1
+          $p = Get-ChildItem -Path $env:PLUGIN_SDK_DIR -Recurse -Filter "Plugin_SA.vcxproj" |
+               Where-Object { $_.FullName -notmatch "unreal" } | Select-Object -First 1
           if (-not $p) {
             Write-Host "Daftar semua .vcxproj yang dihasilkan premake:"
             Get-ChildItem -Path $env:PLUGIN_SDK_DIR -Recurse -Filter *.vcxproj | ForEach-Object { $_.FullName }
