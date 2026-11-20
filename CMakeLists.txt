@@ -15,9 +15,10 @@ add_library(CustomVehicles SHARED src/main.cpp)
 set_target_properties(CustomVehicles PROPERTIES
     PREFIX ""
     SUFFIX ".asi"
-    CXX_STANDARD 20
-    CXX_STANDARD_REQUIRED ON
 )
+
+# safetyhook.hpp (bagian dari Plugin SDK terbaru) memakai std::expected = C++23
+target_compile_options(CustomVehicles PRIVATE /std:c++latest)
 
 # Daftar include & define ini mengikuti proyek open-source yang sudah terbukti
 # jalan dengan Plugin SDK (GTA SA 1.0 US) + premake5 milik Plugin SDK sendiri.
