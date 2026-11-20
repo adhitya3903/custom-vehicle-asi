@@ -23,8 +23,8 @@
 #include <cstring>
 
 static const int TEST_MODEL = 429;     // Banshee (model bawaan GTA, hanya untuk tes tukar)
-static const int KEY_READ   = VK_F10;
-static const int KEY_SWAP   = VK_F11;
+static const int HOTKEY_READ   = VK_F10;
+static const int HOTKEY_SWAP   = VK_F11;
 
 static char g_logPath[MAX_PATH] = {0};
 
@@ -169,8 +169,8 @@ static DWORD WINAPI KeyThread(LPVOID)
             continue;
         }
 
-        bool r = (GetAsyncKeyState(KEY_READ) & 0x8000) != 0;
-        bool s = (GetAsyncKeyState(KEY_SWAP) & 0x8000) != 0;
+        bool r = (GetAsyncKeyState(HOTKEY_READ) & 0x8000) != 0;
+        bool s = (GetAsyncKeyState(HOTKEY_SWAP) & 0x8000) != 0;
 
         if (r && !readWas)
         {
