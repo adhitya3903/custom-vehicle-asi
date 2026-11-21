@@ -3,6 +3,9 @@
 //  F10 = BACA SAJA (aman): catat model kendaraan yang sedang kamu naiki.
 //  F11 = TES TUKAR MODEL: tukar model kendaraan yang kamu naiki ke Banshee (429).
 //        Tekan F11 lagi di kendaraan yang sama untuk mengembalikan ke model asli.
+//  F12 = TES ISOLASI: jalankan urutan tukar yang SAMA, tapi ke model yang SAMA
+//        (misal Infernus -> Infernus). Kalau ini juga crash, masalahnya ada di
+//        urutan tukarnya; kalau selamat, masalahnya ada di data khusus model lain.
 //
 // (F1, Tab, F4, F5, F7, F8, F9, T/F6, G sudah dipakai SA-MP, jadi dihindari.)
 //
@@ -27,6 +30,7 @@
 static const int TEST_MODEL = 429;     // Banshee (model bawaan GTA, hanya untuk tes tukar)
 static const int HOTKEY_READ = VK_F10;
 static const int HOTKEY_SWAP = VK_F11;
+static const int HOTKEY_SELF = VK_F12;
 
 static char g_logPath[MAX_PATH] = {0};
 
@@ -69,8 +73,10 @@ static unsigned int GetLoadState(int modelId)
 static void DumpNodes(CVehicle* veh, const char* label)
 {
     unsigned int* n = (unsigned int*)((unsigned char*)veh + 0x648);
-    Log("%s: node[1..8] = %08X %08X %08X %08X %08X %08X %08X %08X",
-        label, n[1], n[2], n[3], n[4], n[5], n[6], n[7], n[8]);
+    Log("%s: node[1..11]  = %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X",
+        label, n[1], n[2], n[3], n[4], n[5], n[6], n[7], n[8], n[9], n[10], n[11]);
+    Log("%s: node[12..22] = %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X",
+        label, n[12], n[13], n[14], n[15], n[16], n[17], n[18], n[19], n[20], n[21], n[22]);
 }
 
 // ---------------------------------------------------------------- baca saja
@@ -164,9 +170,41 @@ static void OnSwap()
     }
 }
 
+// ---------------------------------------------------------------- tes isolasi (model yang sama)
+static void OnSelfSwap()
+{
+    CVehicle* veh = FindPlayerVehicle(-1, false);
+    if (!veh)
+    {
+        Log("ISOLASI: kamu tidak sedang di dalam kendaraan.");
+        return;
+    }
+
+    int current = (int)veh->m_nModelIndex;
+    if (current < 400 || current > 611)
+    {
+        Log("ISOLASI: model %d bukan kendaraan standar (400-611), dibatalkan.", current);
+        return;
+    }
+
+    Log("ISOLASI: tukar ke model YANG SAMA (%d) dengan urutan yang sama", current);
+    DumpNodes(veh, "ISOLASI node SEBELUM");
+
+    Log("ISOLASI: [1/3] DeleteRwObject...");
+    veh->DeleteRwObject();
+
+    Log("ISOLASI: [2/3] SetModelIndex(%d)...", current);
+    veh->SetModelIndex(current);
+
+    DumpNodes(veh, "ISOLASI node SESUDAH");
+    Log("ISOLASI: [3/3] selesai. Menunggu 5 frame untuk memastikan game selamat...");
+    g_framesToWatch = 5;
+}
+
 // ---------------------------------------------------------------- jembatan thread tombol -> thread game
 static volatile LONG g_pendRead = 0;
 static volatile LONG g_pendSwap = 0;
+static volatile LONG g_pendSelf = 0;
 static volatile LONG g_cntProcess = 0;
 static volatile LONG g_cntDraw = 0;
 
@@ -185,6 +223,7 @@ static void Pump(volatile LONG* counter, const char* name)
 
     if (InterlockedExchange(&g_pendRead, 0)) OnRead();
     if (InterlockedExchange(&g_pendSwap, 0)) OnSwap();
+    if (InterlockedExchange(&g_pendSelf, 0)) OnSelfSwap();
 }
 
 static void OnGameProcess() { Pump(&g_cntProcess, "gameProcessEvent"); }
@@ -195,6 +234,7 @@ static DWORD WINAPI KeyThread(LPVOID)
 {
     bool readWas = false;
     bool swapWas = false;
+    bool selfWas = false;
 
     for (;;)
     {
@@ -204,12 +244,13 @@ static DWORD WINAPI KeyThread(LPVOID)
         GetWindowThreadProcessId(GetForegroundWindow(), &fgPid);
         if (fgPid != GetCurrentProcessId())
         {
-            readWas = swapWas = false;
+            readWas = swapWas = selfWas = false;
             continue;
         }
 
         bool r = (GetAsyncKeyState(HOTKEY_READ) & 0x8000) != 0;
         bool s = (GetAsyncKeyState(HOTKEY_SWAP) & 0x8000) != 0;
+        bool q = (GetAsyncKeyState(HOTKEY_SELF) & 0x8000) != 0;
 
         if (r && !readWas)
         {
@@ -222,8 +263,15 @@ static DWORD WINAPI KeyThread(LPVOID)
             InterlockedExchange(&g_pendSwap, 1);
         }
 
+        if (q && !selfWas)
+        {
+            Log("tombol ISOLASI (F12) terdeteksi");
+            InterlockedExchange(&g_pendSelf, 1);
+        }
+
         readWas = r;
         swapWas = s;
+        selfWas = q;
     }
     return 0;
 }
@@ -233,7 +281,7 @@ class CustomVehiclesPlugin
 public:
     CustomVehiclesPlugin()
     {
-        Log("=== CustomVehicles (tahap 1, percobaan 2: F10 baca, F11 tukar) ter-load ===");
+        Log("=== CustomVehicles (tahap 1, percobaan 3: F10 baca, F11 tukar, F12 isolasi) ter-load ===");
         plugin::Events::gameProcessEvent.before += OnGameProcess;
         plugin::Events::drawingEvent += OnDrawing;
 
