@@ -20,6 +20,7 @@
 #include "plugin.h"
 #include "game_sa/common.h"
 #include "game_sa/CVehicle.h"
+#include "game_sa/CAutomobile.h"
 #include "game_sa/CStreaming.h"
 
 #include <windows.h>
@@ -76,11 +77,13 @@ struct ColInfo
     unsigned int mi;
     unsigned int col;
     unsigned int data;
+    unsigned int numLines;   // jumlah suspension lines (CColData offset 0x06)
+    unsigned int linesPtr;   // pointer array suspension lines (CColData offset 0x10)
 };
 
 static ColInfo GetColInfo(int modelId)
 {
-    ColInfo c = {0, 0, 0};
+    ColInfo c = {0, 0, 0, 0, 0};
     if (modelId < 0 || modelId >= 20000) return c;
     c.mi = *(unsigned int*)(0xA9B0C8 + modelId * 4);
     if (c.mi)
@@ -89,14 +92,20 @@ static ColInfo GetColInfo(int modelId)
         if (c.col)
             c.data = *(unsigned int*)(c.col + 0x2C);
     }
+    if (c.data)
+    {
+        c.numLines = *(unsigned char*)(c.data + 0x06);
+        c.linesPtr = *(unsigned int*)(c.data + 0x10);
+    }
     return c;
 }
 
 static void LogColInfo(const char* label, int modelId)
 {
     ColInfo c = GetColInfo(modelId);
-    Log("%s: model %d: modelInfo=%08X colModel=%08X colData=%08X %s",
-        label, modelId, c.mi, c.col, c.data, c.data ? "(ada)" : "(KOSONG!)");
+    Log("%s: model %d: modelInfo=%08X colModel=%08X colData=%08X %s | suspensi: jumlah=%u ptr=%08X %s",
+        label, modelId, c.mi, c.col, c.data, c.data ? "(ada)" : "(KOSONG!)",
+        c.numLines, c.linesPtr, c.linesPtr ? "(ada)" : "(KOSONG!)");
 }
 
 // Dump mentah pointer node bodi (m_aCarNodes). Offset 0x648 adalah tebakan dari
@@ -193,10 +202,17 @@ static void OnSwap()
     Log("TUKAR: [4/6] DeleteRwObject selesai. Memanggil SetModelIndex(%d)...", target);
     veh->SetModelIndex(target);
 
-    Log("TUKAR: [5/6] SetModelIndex selesai. m_nModelIndex = %d", (int)veh->m_nModelIndex);
+    Log("TUKAR: [5/7] SetModelIndex selesai. m_nModelIndex = %d", (int)veh->m_nModelIndex);
+
+    // Dugaan penyebab crash: suspension lines belum disiapkan untuk model baru.
+    // Game memanggil ini sendiri saat membuat mobil baru; kita meniru urutan itu.
+    Log("TUKAR: [6/7] memanggil SetupSuspensionLines...");
+    static_cast<CAutomobile*>(veh)->SetupSuspensionLines();
+    Log("TUKAR: SetupSuspensionLines selesai");
+    LogColInfo("TUKAR target SESUDAH", target);
     DumpNodes(veh, "TUKAR node SESUDAH");
 
-    Log("TUKAR: [6/6] selesai. Menunggu 5 frame untuk memastikan game selamat...");
+    Log("TUKAR: [7/7] selesai. Menunggu 5 frame untuk memastikan game selamat...");
     g_framesToWatch = 5;
 
     if (restoring)
@@ -322,7 +338,7 @@ class CustomVehiclesPlugin
 public:
     CustomVehiclesPlugin()
     {
-        Log("=== CustomVehicles (tahap 1, percobaan 4: F10 baca, F11 tukar, F12 isolasi) ter-load ===");
+        Log("=== CustomVehicles (tahap 1, percobaan 5: F10 baca, F11 tukar, F12 isolasi) ter-load ===");
         plugin::Events::gameProcessEvent.before += OnGameProcess;
         plugin::Events::drawingEvent += OnDrawing;
 
