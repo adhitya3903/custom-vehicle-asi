@@ -68,6 +68,37 @@ static unsigned int GetLoadState(int modelId)
     return *(unsigned char*)(0x8E4CC0 + modelId * 20 + 0x10);
 }
 
+// Data collision model: dari tabel model info asli (0xA9B0C8) -> CBaseModelInfo::pColModel
+// (offset 0x14) -> CColModel::m_data (offset 0x2C) berdasarkan struktur CColModelSAInterface
+// di kode MTA. "data" = 0 artinya data collision (termasuk suspension lines) BELUM ada.
+struct ColInfo
+{
+    unsigned int mi;
+    unsigned int col;
+    unsigned int data;
+};
+
+static ColInfo GetColInfo(int modelId)
+{
+    ColInfo c = {0, 0, 0};
+    if (modelId < 0 || modelId >= 20000) return c;
+    c.mi = *(unsigned int*)(0xA9B0C8 + modelId * 4);
+    if (c.mi)
+    {
+        c.col = *(unsigned int*)(c.mi + 0x14);
+        if (c.col)
+            c.data = *(unsigned int*)(c.col + 0x2C);
+    }
+    return c;
+}
+
+static void LogColInfo(const char* label, int modelId)
+{
+    ColInfo c = GetColInfo(modelId);
+    Log("%s: model %d: modelInfo=%08X colModel=%08X colData=%08X %s",
+        label, modelId, c.mi, c.col, c.data, c.data ? "(ada)" : "(KOSONG!)");
+}
+
 // Dump mentah pointer node bodi (m_aCarNodes). Offset 0x648 adalah tebakan dari
 // struktur CAutomobile; kalau salah, yang tercatat cuma angka acak (tidak berbahaya).
 static void DumpNodes(CVehicle* veh, const char* label)
@@ -99,6 +130,7 @@ static void OnRead()
     }
     if (model >= 400 && model <= 611)
         Log("BACA: status streaming model %d = %u (1 = loaded)", model, GetLoadState(model));
+    LogColInfo("BACA", model);
 
     DumpNodes(veh, "BACA");
 }
@@ -143,7 +175,16 @@ static void OnSwap()
         return;
     }
 
-    // 2. tukar
+    // 2. cek data collision (dugaan penyebab crash: colData model target kosong)
+    LogColInfo("TUKAR asal  ", current);
+    LogColInfo("TUKAR target", target);
+    if (GetColInfo(target).data == 0)
+    {
+        Log("TUKAR: colData model target KOSONG. DIBATALKAN supaya game tidak crash.");
+        return;
+    }
+
+    // 3. tukar
     DumpNodes(veh, "TUKAR node SEBELUM");
 
     Log("TUKAR: [3/6] memanggil DeleteRwObject...");
@@ -281,7 +322,7 @@ class CustomVehiclesPlugin
 public:
     CustomVehiclesPlugin()
     {
-        Log("=== CustomVehicles (tahap 1, percobaan 3: F10 baca, F11 tukar, F12 isolasi) ter-load ===");
+        Log("=== CustomVehicles (tahap 1, percobaan 4: F10 baca, F11 tukar, F12 isolasi) ter-load ===");
         plugin::Events::gameProcessEvent.before += OnGameProcess;
         plugin::Events::drawingEvent += OnDrawing;
 
