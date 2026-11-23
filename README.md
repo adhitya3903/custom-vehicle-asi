@@ -1,55 +1,59 @@
-# Custom Vehicle ASI (`custom-vehicle-asi`)
+# CustomVehicles (ASI) — Experimental
 
-[![Build Status](https://img.shields.io/badge/build-GitHub%20Actions-blue.svg)](https://github.com/adhitya3903/custom-vehicle-asi/actions)
-[![Platform](https://img.shields.io/badge/platform-PC%20(Windows)-lightgrey.svg)]()
-[![Game](https://img.shields.io/badge/game-GTA%20SA%20%7C%20SA--MP%20%7C%20open.mp-orange.svg)]()
+> **EN:** An experimental GTA San Andreas (PC, 1.0 US) ASI plugin that swaps the model of the vehicle you are driving at runtime. Proof of concept for a custom-vehicle system for SA-MP 0.3.DL servers.
+>
+> **ID:** Plugin ASI eksperimental untuk GTA San Andreas (PC, 1.0 US) yang menukar model kendaraan yang sedang kamu kendarai saat game berjalan. Ini *proof of concept* untuk sistem kendaraan custom di server SA-MP 0.3.DL.
 
-A lightweight client-side `.asi` plugin designed to extend vehicle customization capabilities in **SA-MP** and **open.mp**. Built to overcome the native limitation of `AddSimpleModel` and `AddCharModel` (which natively restrict custom vehicle models) by dynamically swapping and loading custom `.dff` and `.txd` vehicle models directly on the client side.
-
-> **Catatan (ID):** Plugin `.asi` client-side ini dikembangkan khusus untuk memungkinkan penggantian model/skin kendaraan kustom (`.dff` & `.txd`) secara dinamis pada SA-MP / open.mp PC tanpa mengubah file bawaan `gta3.img` secara permanen.
+⚠️ **Status: alpha / test build.** Not ready for public servers. / **Belum siap dipakai di server publik.**
 
 ---
 
-## ✨ Features & Development Roadmap
-- **Dynamic Vehicle Model Swapping:** Replaces specific base vehicle models (e.g., Infernus) in memory during runtime.
-- **Zero-IMG Modification:** Works seamlessly alongside ASI Loader without corrupting original game archives.
-- **Automated Cloud Build:** Compiled cleanly using CMake and GitHub Actions.
-- **Server-Side Integration Ready:** Designed to communicate with Pawn scripts (SA-MP / open.mp) for future server-wide model synchronization.
+## Features / Fitur
 
-*(Current Status: Stage 1 Experimental Build — PC Client Only)*
+- Hotkey **F10** — log the model ID of the vehicle you are in (read-only, safe). / Catat ID model kendaraan (hanya baca, aman).
+- Hotkey **F11** — swap your current car to a *donor* model; press again to restore. / Tukar mobil ke model *donor*; tekan lagi untuk mengembalikan.
+- Hotkey **F12** — isolation test (swap to the same model). / Tes isolasi (tukar ke model yang sama).
+- Donor model ID configurable through `CustomVehicles.ini`. / ID donor bisa diatur lewat `CustomVehicles.ini`.
+- Detailed log file `CustomVehicles.log` for debugging. / Log rinci untuk debugging.
 
----
+## Requirements / Kebutuhan
 
-## 📋 Prerequisites (Persyaratan Sistem)
-Before installing this plugin, ensure your GTA San Andreas directory meets the following requirements:
-1. **GTA San Andreas v1.0 US**.
-2. **SA-MP 0.3.DL** or **open.mp** client (`samp.dll`).
-3. **Ultimate ASI Loader** (`vorbisFile.dll` / `dinput8.dll`) installed in your root GTA SA folder.
+- GTA San Andreas **1.0 US** (PC)
+- An ASI Loader (`dinput8.dll`)
+- Tested with SA-MP **0.3.DL** (PC) / Diuji dengan SA-MP **0.3.DL** (PC)
+- **Cars only** (automobile class). Do not use on bikes, boats, planes or helicopters. / **Hanya mobil.**
 
----
+## Install / Cara pasang
 
-## 🚀 Installation & Usage (Cara Pemakaian)
-1. Download the latest compiled `.asi` file from the [**Releases**](https://github.com/adhitya3903/custom-vehicle-asi/releases) page (or build it yourself via GitHub Actions).
-2. Place the `.asi` file directly into your **GTA San Andreas root folder** (e.g., `D:\Game\GTA SAMP\`) or inside your `scripts/` folder.
-3. Ensure your custom vehicle assets (`.dff` and `.txd`) are placed in the designated mod/cache directory as configured in the source.
-4. Launch SA-MP / open.mp and connect to the server. The plugin will automatically initialize and hook into the game memory.
+1. Copy `CustomVehicles.asi` and `CustomVehicles.ini` into your GTA folder (next to `gta_sa.exe`).
+2. Edit `Donor=` in `CustomVehicles.ini` to a vehicle model ID your server does **not** use (400–611).
+3. Start the game, join a server, sit in a normal car, press **F10** / **F11**.
+4. Check `CustomVehicles.log` if something goes wrong.
 
----
+## How it works / Cara kerja
 
-## 🛠️ Building from Source
-This repository uses **CMake** and **GitHub Actions** for automated compilation (no local Visual Studio installation required):
-1. Fork or clone this repository.
-2. Push any changes to `src/main.cpp` or `CMakeLists.txt`.
-3. Navigate to the **Actions** tab on GitHub to download the compiled `.asi` artifact.
+The plugin hooks into the game loop (through Plugin SDK), reads your hotkeys, and changes the model index of the vehicle you are driving, then re-initialises its suspension lines. The *donor* model slot can hold a model supplied by another tool (for example a mod loader); this plugin only swaps a vehicle to that slot.
 
----
+Plugin membaca tombol, lalu mengganti model kendaraan yang kamu kendarai dan menyiapkan ulang suspensinya. Slot *donor* bisa diisi model dari alat lain (misalnya mod loader); plugin ini hanya menukar kendaraan ke slot itu.
 
-## ©️ Credits & Terms of Use (Lisensi & Larangan)
-- **Author & Lead Developer:** **Hachiroku** (`adhitya3903`)
-- **Special Thanks:** SA-MP & open.mp Modding Community.
+## Known limitations / Keterbatasan
 
-### ⚠️ STRICTLY NO RE-SHARING / DILARANG MENYEBARLUASKAN ULANG
-- **EN:** This project is published for educational, testing, and personal server integration purposes only. **You are strictly prohibited from re-uploading, re-sharing, redistributing, or claiming this `.asi` plugin and its source code as your own** on any other websites, Discord servers, YouTube links, or repositories without explicit written permission from the author (**Hachiroku**).
-- **ID:** **DILARANG KERAS** mengunggah ulang (*re-upload*), membagikan ulang (*re-share*), atau memperjualbelikan file `.asi` maupun *source code* dari repositori ini di platform mana pun tanpa izin resmi dari pembuat (**Hachiroku**).
+- The swapped car keeps the **handling of the original (base) car**. / Mobil hasil tukar tetap memakai **handling mobil asal**.
+- Hitbox and wheel layout follow the donor model. / Hitbox dan posisi roda mengikuti model donor.
+- Client-side only: other players do not see the change unless they run it too. / Hanya sisi client.
+- Can crash the game on unsupported vehicle types. / Bisa membuat game crash pada jenis kendaraan yang tidak didukung.
+- No downloader or server link yet. / Belum ada downloader maupun hubungan ke server.
 
----
+## Credits / Kredit
+
+- Developed by **[NAMA KAMU]**
+- Built with [Plugin SDK](https://github.com/DK22Pac/plugin-sdk) by DK22Pac and contributors. See their repository for its license terms.
+- *(Optional — only if you used it)* Test models prepared with **GTA SA Skin Studio** by **Zen** (a separate closed-source app; not included or redistributed here).
+
+## License & Disclaimer
+
+© 2026 **[NAMA KAMU]**. *(Choose your license and add a `LICENSE` file. Before you pick one, check the license of Plugin SDK to make sure they are compatible.)*
+
+This is an independent fan-made project. It is **not affiliated with, endorsed by, or sponsored by** Rockstar Games, Take-Two Interactive, or the SA-MP / open.mp teams. Use at your own risk and always back up your game files.
+
+Proyek ini dibuat penggemar secara independen dan **tidak berafiliasi** dengan Rockstar Games, Take-Two Interactive, maupun tim SA-MP / open.mp. Gunakan dengan risiko sendiri dan selalu backup file game.
