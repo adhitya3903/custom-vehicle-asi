@@ -44,15 +44,14 @@ Plugin membaca tombol, lalu mengganti model kendaraan yang kamu kendarai dan men
 - Can crash the game on unsupported vehicle types. / Bisa membuat game crash pada jenis kendaraan yang tidak didukung.
 - No downloader or server link yet. / Belum ada downloader maupun hubungan ke server.
 
-## Credits / Kredit
+## Credits
 
-- Developed by **[NAMA KAMU]**
+- Developed by **Hachiroku**
 - Built with [Plugin SDK](https://github.com/DK22Pac/plugin-sdk) by DK22Pac and contributors. See their repository for its license terms.
-- *(Optional — only if you used it)* Test models prepared with **GTA SA Skin Studio** by **Zen** (a separate closed-source app; not included or redistributed here).
 
 ## License & Disclaimer
 
-© 2026 **[NAMA KAMU]**. *(Choose your license and add a `LICENSE` file. Before you pick one, check the license of Plugin SDK to make sure they are compatible.)*
+© 2026 **Hachiroku**. *(Choose your license and add a `LICENSE` file. Before you pick one, check the license of Plugin SDK to make sure they are compatible.)*
 
 This is an independent fan-made project. It is **not affiliated with, endorsed by, or sponsored by** Rockstar Games, Take-Two Interactive, or the SA-MP / open.mp teams. Use at your own risk and always back up your game files.
 
