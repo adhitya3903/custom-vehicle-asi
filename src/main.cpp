@@ -1,7 +1,8 @@
-// CustomVehicles - TAHAP 1, PERCOBAAN 2 (diagnostik rinci)
+// CustomVehicles - TAHAP B1a (tukar ke model "donor" yang bisa diatur lewat INI)
 //
 //  F10 = BACA SAJA (aman): catat model kendaraan yang sedang kamu naiki.
-//  F11 = TES TUKAR MODEL: tukar model kendaraan yang kamu naiki ke Banshee (429).
+//  F11 = TUKAR MODEL: tukar model kendaraan yang kamu naiki ke model DONOR.
+//        ID donor dibaca dari CustomVehicles.ini di folder GTA (lihat README).
 //        Tekan F11 lagi di kendaraan yang sama untuk mengembalikan ke model asli.
 //  F12 = TES ISOLASI: jalankan urutan tukar yang SAMA, tapi ke model yang SAMA
 //        (misal Infernus -> Infernus). Kalau ini juga crash, masalahnya ada di
@@ -28,7 +29,25 @@
 #include <cstdarg>
 #include <cstring>
 
-static const int TEST_MODEL = 429;     // Banshee (model bawaan GTA, hanya untuk tes tukar)
+static const int DEFAULT_DONOR = 503;  // dipakai kalau CustomVehicles.ini tidak ada / tidak valid
+
+// Baca ID donor dari CustomVehicles.ini (folder GTA):
+//   [CustomVehicles]
+//   Donor=503
+static int GetDonorModel()
+{
+    char exe[MAX_PATH] = {0};
+    GetModuleFileNameA(NULL, exe, MAX_PATH);
+    char* slash = strrchr(exe, '\\');
+    if (slash) *slash = 0;
+
+    char ini[MAX_PATH] = {0};
+    sprintf_s(ini, "%s\\CustomVehicles.ini", exe);
+
+    int v = (int)GetPrivateProfileIntA("CustomVehicles", "Donor", DEFAULT_DONOR, ini);
+    if (v < 400 || v > 611) v = DEFAULT_DONOR;
+    return v;
+}
 static const int HOTKEY_READ = VK_F10;
 static const int HOTKEY_SWAP = VK_F11;
 static const int HOTKEY_SELF = VK_F12;
@@ -166,7 +185,9 @@ static void OnSwap()
     }
 
     bool restoring = (g_swapVeh == veh && g_swapOriginal != 0);
-    int target = restoring ? g_swapOriginal : ((current == TEST_MODEL) ? 411 : TEST_MODEL);
+    int donor = GetDonorModel();
+    int target = restoring ? g_swapOriginal : ((current == donor) ? 411 : donor);
+    if (!restoring) Log("TUKAR: donor dari INI = %d", donor);
 
     Log("TUKAR: %s model %d -> %d", restoring ? "KEMBALIKAN" : "TUKAR", current, target);
 
@@ -338,7 +359,7 @@ class CustomVehiclesPlugin
 public:
     CustomVehiclesPlugin()
     {
-        Log("=== CustomVehicles (tahap 1, percobaan 5: F10 baca, F11 tukar, F12 isolasi) ter-load ===");
+        Log("=== CustomVehicles (tahap 1, B1a: F10 baca, F11 tukar ke donor, F12 isolasi) ter-load ===");
         plugin::Events::gameProcessEvent.before += OnGameProcess;
         plugin::Events::drawingEvent += OnDrawing;
 
