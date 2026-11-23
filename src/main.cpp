@@ -138,6 +138,32 @@ static void DumpNodes(CVehicle* veh, const char* label)
         label, n[12], n[13], n[14], n[15], n[16], n[17], n[18], n[19], n[20], n[21], n[22]);
 }
 
+// Dump data handling kendaraan (struktur tHandlingData, 0xE0 byte) ke log, hanya BACA.
+// Pointer handling ada di CVehicle offset 0x384 (900 desimal, sesuai struktur CVehicle
+// di MTA). Tujuannya mencocokkan isi dump dengan baris kendaraan itu di data\handling.cfg
+// supaya offset field suspensi bisa dipastikan sebelum kita pernah MENULIS ke handling.
+static void DumpHandling(CVehicle* veh, const char* label)
+{
+    unsigned int hp = *(unsigned int*)((unsigned char*)veh + 0x384);
+    Log("%s: pointer handling = %08X", label, hp);
+    if (hp == 0 || IsBadReadPtr((const void*)hp, 0xE0))
+    {
+        Log("%s: pointer handling tidak valid, dump dilewati.", label);
+        return;
+    }
+
+    unsigned int* d = (unsigned int*)hp;
+    for (int i = 0; i < 0xE0 / 4; i += 4)
+    {
+        float f0 = *(float*)&d[i + 0];
+        float f1 = *(float*)&d[i + 1];
+        float f2 = *(float*)&d[i + 2];
+        float f3 = *(float*)&d[i + 3];
+        Log("%s: +%02X: %08X(%g) %08X(%g) %08X(%g) %08X(%g)", label, i * 4,
+            d[i + 0], f0, d[i + 1], f1, d[i + 2], f2, d[i + 3], f3);
+    }
+}
+
 // ---------------------------------------------------------------- baca saja
 static void OnRead()
 {
@@ -161,6 +187,7 @@ static void OnRead()
     LogColInfo("BACA", model);
 
     DumpNodes(veh, "BACA");
+    DumpHandling(veh, "BACA handling");
 }
 
 // ---------------------------------------------------------------- tukar model
@@ -359,7 +386,7 @@ class CustomVehiclesPlugin
 public:
     CustomVehiclesPlugin()
     {
-        Log("=== CustomVehicles (tahap 1, B1a: F10 baca, F11 tukar ke donor, F12 isolasi) ter-load ===");
+        Log("=== CustomVehicles (tahap 1, B1a+: F10 baca + dump handling, F11 tukar ke donor, F12 isolasi) ter-load ===");
         plugin::Events::gameProcessEvent.before += OnGameProcess;
         plugin::Events::drawingEvent += OnDrawing;
 
