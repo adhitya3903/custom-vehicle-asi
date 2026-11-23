@@ -8,7 +8,7 @@
 
 ---
 
-## Features / Fitur
+## Features
 
 - Hotkey **F10** — log the model ID of the vehicle you are in (read-only, safe). / Catat ID model kendaraan (hanya baca, aman).
 - Hotkey **F11** — swap your current car to a *donor* model; press again to restore. / Tukar mobil ke model *donor*; tekan lagi untuk mengembalikan.
@@ -16,14 +16,14 @@
 - Donor model ID configurable through `CustomVehicles.ini`. / ID donor bisa diatur lewat `CustomVehicles.ini`.
 - Detailed log file `CustomVehicles.log` for debugging. / Log rinci untuk debugging.
 
-## Requirements / Kebutuhan
+## Requirements 
 
 - GTA San Andreas **1.0 US** (PC)
 - An ASI Loader (`dinput8.dll`)
-- Tested with SA-MP **0.3.DL** (PC) / Diuji dengan SA-MP **0.3.DL** (PC)
-- **Cars only** (automobile class). Do not use on bikes, boats, planes or helicopters. / **Hanya mobil.**
+- Tested with SA-MP **0.3.DL** (PC)
+- **Cars only** (automobile class). Do not use on bikes, boats, planes or helicopters.
 
-## Install / Cara pasang
+## Install
 
 1. Copy `CustomVehicles.asi` and `CustomVehicles.ini` into your GTA folder (next to `gta_sa.exe`).
 2. Edit `Donor=` in `CustomVehicles.ini` to a vehicle model ID your server does **not** use (400–611).
