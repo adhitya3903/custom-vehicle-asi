@@ -316,10 +316,22 @@ static bool EnsureCustomDonor(int donor, bool force)
     }
 
     Log("MUAT: [6/8] LoadClumpFile(%s, %d)...", dffRel, donor);
+    // Di Plugin SDK, LoadClumpFile hanya menerima stream. Stream dibuka sendiri; TIDAK kita
+    // tutup dari sini (kalau game sudah menutupnya, menutup dua kali akan crash).
+    RwStream* dffStream = RwStreamOpen(rwSTREAMFILENAME, rwSTREAMREAD, dffRel);
+    Log("MUAT: stream DFF = %p", (void*)dffStream);
+    if (!dffStream)
+    {
+        g_donorBroken = true;
+        Log("MUAT: GAGAL membuka stream DFF. Donor ditandai rusak (restart game).");
+        return false;
+    }
+
     CTxdStore::PushCurrentTxd();
     CTxdStore::SetCurrentTxd(txdSlot);
-    CFileLoader::LoadClumpFile(dffRel, (unsigned int)donor);
+    bool okDff = CFileLoader::LoadClumpFile(dffStream, (unsigned int)donor);
     CTxdStore::PopCurrentTxd();
+    Log("MUAT: LoadClumpFile hasil = %d", okDff ? 1 : 0);
 
     rwObj = *(unsigned int*)(miPtr + 0x1C);
     Log("MUAT: [7/8] LoadClumpFile selesai. clump baru = %08X", rwObj);
