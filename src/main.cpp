@@ -1,24 +1,19 @@
-// CustomVehicles - TAHAP B1b (muat model custom dari FILE ke slot donor, tanpa modloader)
+// CustomVehicles - TAHAP B1c (kolam donor: banyak model custom, dimuat dari FILE, tanpa modloader)
 //
-//  F10 = BACA SAJA (aman): catat model kendaraan yang sedang kamu naiki.
-//  F11 = TUKAR MODEL: tukar model kendaraan yang kamu naiki ke model DONOR.
-//        ID donor dibaca dari CustomVehicles.ini di folder GTA (lihat README).
-//        Tekan F11 lagi di kendaraan yang sama untuk mengembalikan ke model asli.
-//  INSERT = MUAT model custom dari file (CustomVehicles\\<File>.dff/.txd) ke slot donor.
-//        F11 juga memuatnya otomatis kalau belum dimuat.
-//  F12 = TES ISOLASI: jalankan urutan tukar yang SAMA, tapi ke model yang SAMA
-//        (misal Infernus -> Infernus). Kalau ini juga crash, masalahnya ada di
-//        urutan tukarnya; kalau selamat, masalahnya ada di data khusus model lain.
+//  INSERT = MUAT semua model di daftar Models= ke kolam donor (diagnostik / preload).
+//  F10    = BACA SAJA (aman): catat model kendaraan yang sedang kamu naiki + data handling.
+//  F11    = TUKAR: ganti kendaraan yang kamu naiki ke model custom berikutnya di daftar.
+//           Tekan lagi untuk model custom berikutnya; setelah model terakhir, kembali ke model asli.
+//  F12    = TES ISOLASI: tukar ke model yang SAMA (untuk membedakan masalah urutan vs masalah data).
+//
+// Konfigurasi di CustomVehicles.ini (folder GTA):
+//   Donors=503,502,494,504     <- slot kendaraan yang TIDAK dipakai servermu (400-611)
+//   Models=infernus,r32        <- file CustomVehicles\<nama>.dff dan .txd
 //
 // (F1, Tab, F4, F5, F7, F8, F9, T/F6, G sudah dipakai SA-MP, jadi dihindari.)
 //
-// Perubahan dari percobaan 1:
-//  - Cek status streaming model target; kalau BELUM ter-load, tukar dibatalkan (aman).
-//  - Model lama dibuang dulu (DeleteRwObject) sebelum SetModelIndex, meniru cara game
-//    me-recreate kendaraan.
-//  - Dump pointer "node" bodi kendaraan sebelum/sesudah (untuk membuktikan apakah
-//    node jadi kosong setelah tukar, dugaan penyebab crash percobaan 1).
-//  - Log 5 frame setelah tukar: kalau muncul "frame ... selesai", game selamat.
+// Batasan versi ini: model yang sudah dimuat ke sebuah donor tidak dibuang lagi selama game
+// berjalan (belum ada "eviction"). Jumlah model berbeda yang bisa dipakai = jumlah donor.
 
 #include "plugin.h"
 #include "game_sa/common.h"
@@ -33,26 +28,7 @@
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
-
-static const int DEFAULT_DONOR = 503;  // dipakai kalau CustomVehicles.ini tidak ada / tidak valid
-
-// Baca ID donor dari CustomVehicles.ini (folder GTA):
-//   [CustomVehicles]
-//   Donor=503
-static int GetDonorModel()
-{
-    char exe[MAX_PATH] = {0};
-    GetModuleFileNameA(NULL, exe, MAX_PATH);
-    char* slash = strrchr(exe, '\\');
-    if (slash) *slash = 0;
-
-    char ini[MAX_PATH] = {0};
-    sprintf_s(ini, "%s\\CustomVehicles.ini", exe);
-
-    int v = (int)GetPrivateProfileIntA("CustomVehicles", "Donor", DEFAULT_DONOR, ini);
-    if (v < 400 || v > 611) v = DEFAULT_DONOR;
-    return v;
-}
+#include <cstdlib>
 
 static void GetGameDir(char* out, size_t size)
 {
@@ -61,16 +37,6 @@ static void GetGameDir(char* out, size_t size)
     char* slash = strrchr(exe, '\\');
     if (slash) *slash = 0;
     strcpy_s(out, size, exe);
-}
-
-// Nama dasar file model custom dari INI: File=infernus  ->  CustomVehicles\infernus.dff/.txd
-static void GetCustomFileName(char* out, size_t size)
-{
-    char dir[MAX_PATH] = {0};
-    GetGameDir(dir, sizeof(dir));
-    char ini[MAX_PATH] = {0};
-    sprintf_s(ini, "%s\\CustomVehicles.ini", dir);
-    GetPrivateProfileStringA("CustomVehicles", "File", "", out, (DWORD)size, ini);
 }
 
 static bool FileExistsA(const char* path)
@@ -221,31 +187,111 @@ static void OnRead()
     DumpHandling(veh, "BACA handling");
 }
 
-// ---------------------------------------------------------------- B1b: muat model dari file
-static unsigned int g_customClump = 0;   // pointer clump custom yang sedang terpasang di donor
-static bool g_donorBroken = false;       // true kalau muat gagal di tengah jalan (donor tidak aman dipakai)
-static CVehicle* g_swapVeh = nullptr;    // kendaraan yang sedang ditukar (dideklarasi di sini supaya bisa dicek)
+// ---------------------------------------------------------------- konfigurasi (INI)
+static const int MAX_DONORS = 16;
+static const int MAX_MODELS = 32;
 
-// Mengganti isi model donor dengan model dari file, memakai fungsi loader bawaan game:
-//   1) pastikan model donor (versi asli) sudah ter-load
-//   2) buang clump lama, buang TXD lama
-//   3) muat TXD custom ke slot TXD donor, lalu muat DFF custom ke model donor
-// force=false: lewati kalau model custom sudah terpasang.
-static bool EnsureCustomDonor(int donor, bool force)
+struct DonorSlot
 {
-    if (g_donorBroken)
+    int id;                 // ID model kendaraan yang dipakai sebagai wadah (400-611)
+    int modelIdx;           // indeks di g_models yang sedang dimuat di slot ini, -1 = kosong
+    unsigned int clump;     // pointer clump custom yang terpasang (untuk mendeteksi kalau dibuang game)
+    bool broken;            // true kalau muat gagal di tengah jalan (slot tidak aman)
+};
+
+static DonorSlot g_donors[MAX_DONORS];
+static int g_donorCount = 0;
+static char g_models[MAX_MODELS][64];
+static int g_modelCount = 0;
+static bool g_configLoaded = false;
+
+static void ReadIni(const char* key, char* out, size_t size)
+{
+    char dir[MAX_PATH] = {0};
+    GetGameDir(dir, sizeof(dir));
+    char ini[MAX_PATH] = {0};
+    sprintf_s(ini, "%s\\CustomVehicles.ini", dir);
+    GetPrivateProfileStringA("CustomVehicles", key, "", out, (DWORD)size, ini);
+}
+
+static void ParseCsv(const char* src, char out[][64], int maxItems, int& count)
+{
+    char buf[512] = {0};
+    strncpy_s(buf, sizeof(buf), src, _TRUNCATE);
+    char* ctx = nullptr;
+    for (char* tok = strtok_s(buf, ",", &ctx); tok && count < maxItems; tok = strtok_s(nullptr, ",", &ctx))
     {
-        Log("MUAT: donor RUSAK dari percobaan sebelumnya, tidak aman dipakai. Restart game.");
-        return false;
+        while (*tok == ' ' || *tok == '\t') tok++;
+        char* end = tok + strlen(tok);
+        while (end > tok && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n')) *--end = 0;
+        if (*tok)
+        {
+            strncpy_s(out[count], 64, tok, _TRUNCATE);
+            count++;
+        }
+    }
+}
+
+static void EnsureConfig()
+{
+    if (g_configLoaded) return;
+    g_configLoaded = true;
+
+    char buf[512] = {0};
+
+    // donor: Donors=503,502 (atau format lama Donor=503)
+    ReadIni("Donors", buf, sizeof(buf));
+    if (!buf[0])
+    {
+        char one[32] = {0};
+        ReadIni("Donor", one, sizeof(one));
+        if (one[0]) strncpy_s(buf, sizeof(buf), one, _TRUNCATE);
+        else strcpy_s(buf, "503");
+    }
+    char tmp[MAX_DONORS][64];
+    int n = 0;
+    ParseCsv(buf, tmp, MAX_DONORS, n);
+    for (int i = 0; i < n; i++)
+    {
+        int id = atoi(tmp[i]);
+        if (id < 400 || id > 611) { Log("KONFIG: donor '%s' tidak valid (harus 400-611), dilewati.", tmp[i]); continue; }
+        bool dup = false;
+        for (int j = 0; j < g_donorCount; j++) if (g_donors[j].id == id) dup = true;
+        if (dup) continue;
+        g_donors[g_donorCount].id = id;
+        g_donors[g_donorCount].modelIdx = -1;
+        g_donors[g_donorCount].clump = 0;
+        g_donors[g_donorCount].broken = false;
+        g_donorCount++;
     }
 
-    char file[64] = {0};
-    GetCustomFileName(file, sizeof(file));
-    if (!file[0])
-    {
-        Log("MUAT: INI File= kosong, memakai model donor apa adanya (modloader / bawaan).");
-        return true;
-    }
+    // model: Models=infernus,r32 (atau format lama File=infernus)
+    memset(buf, 0, sizeof(buf));
+    ReadIni("Models", buf, sizeof(buf));
+    if (!buf[0]) ReadIni("File", buf, sizeof(buf));
+    ParseCsv(buf, g_models, MAX_MODELS, g_modelCount);
+
+    Log("KONFIG: %d donor, %d model custom.", g_donorCount, g_modelCount);
+    for (int i = 0; i < g_donorCount; i++) Log("KONFIG: donor[%d] = model %d", i, g_donors[i].id);
+    for (int i = 0; i < g_modelCount; i++) Log("KONFIG: model[%d] = %s", i, g_models[i]);
+}
+
+// ---------------------------------------------------------------- muat model dari file ke sebuah donor
+static bool EnsureModelLoaded(int modelId)
+{
+    CStreaming::RequestModel(modelId, 2);
+    for (int i = 0; i < 10 && GetLoadState(modelId) != 1; i++)
+        CStreaming::LoadAllRequestedModels(false);
+    return GetLoadState(modelId) == 1;
+}
+
+// Mengganti isi model donor dengan model dari file memakai loader bawaan game.
+// Kalau gagal SEBELUM ada yang diubah: return false, slot tetap aman.
+// Kalau gagal SETELAH ada yang diubah: slot ditandai rusak.
+static bool LoadModelIntoDonor(DonorSlot& slot, int modelIdx)
+{
+    const char* file = g_models[modelIdx];
+    int donor = slot.id;
 
     char dir[MAX_PATH] = {0};
     GetGameDir(dir, sizeof(dir));
@@ -256,41 +302,32 @@ static bool EnsureCustomDonor(int donor, bool force)
     sprintf_s(dffFull, "%s\\%s", dir, dffRel);
     sprintf_s(txdFull, "%s\\%s", dir, txdRel);
 
-    Log("MUAT: [1/8] cek file: %s dan %s", dffFull, txdFull);
+    Log("MUAT[%s -> donor %d]: [1/8] cek file...", file, donor);
     if (!FileExistsA(dffFull) || !FileExistsA(txdFull))
     {
-        Log("MUAT: file tidak ditemukan. Buat folder CustomVehicles di folder GTA dan taruh %s.dff / %s.txd di sana.", file, file);
+        Log("MUAT: file tidak ditemukan: %s / %s", dffFull, txdFull);
         return false;
     }
 
     Log("MUAT: [2/8] pastikan model donor %d (versi asli) ter-load...", donor);
-    CStreaming::RequestModel(donor, 2);
-    for (int i = 0; i < 10 && GetLoadState(donor) != 1; i++)
-        CStreaming::LoadAllRequestedModels(false);
-    if (GetLoadState(donor) != 1)
+    if (!EnsureModelLoaded(donor))
     {
-        Log("MUAT: model donor tidak mau ter-load, dibatalkan (belum ada yang diubah).");
+        Log("MUAT: model donor %d tidak mau ter-load, dibatalkan (belum ada yang diubah).", donor);
         return false;
     }
 
     unsigned int miPtr = *(unsigned int*)(0xA9B0C8 + donor * 4);
     if (!miPtr)
     {
-        Log("MUAT: modelInfo donor kosong, dibatalkan (belum ada yang diubah).");
+        Log("MUAT: modelInfo donor %d kosong, dibatalkan (belum ada yang diubah).", donor);
         return false;
     }
     CBaseModelInfo* mi = (CBaseModelInfo*)miPtr;
-    short txdSlot = *(short*)(miPtr + 0x0A);       // CBaseModelInfo::m_nTxdIndex
+    short txdSlot = *(short*)(miPtr + 0x0A);               // CBaseModelInfo::m_nTxdIndex
     unsigned int rwObj = *(unsigned int*)(miPtr + 0x1C);   // CBaseModelInfo::m_pRwObject
+    Log("MUAT: modelInfo=%08X txdSlot=%d clumpSekarang=%08X", miPtr, (int)txdSlot, rwObj);
 
-    Log("MUAT: modelInfo=%08X txdSlot=%d clumpSekarang=%08X clumpCustom=%08X", miPtr, (int)txdSlot, rwObj, g_customClump);
-    if (!force && g_customClump != 0 && rwObj == g_customClump)
-    {
-        Log("MUAT: model custom sudah terpasang, dilewati.");
-        return true;
-    }
-
-    // mulai dari sini kondisi donor berubah. Kalau gagal, donor ditandai rusak.
+    // ---- mulai dari sini kondisi donor berubah
     Log("MUAT: [3/8] DeleteRwObject (buang clump lama)...");
     mi->DeleteRwObject();
 
@@ -302,13 +339,12 @@ static bool EnsureCustomDonor(int donor, bool force)
     Log("MUAT: LoadTxd hasil = %d", okTxd ? 1 : 0);
     if (!okTxd)
     {
-        g_donorBroken = true;
-        Log("MUAT: GAGAL memuat TXD. Donor ditandai rusak (jangan dipakai, restart game).");
+        slot.broken = true;
+        Log("MUAT: GAGAL memuat TXD. Donor %d ditandai rusak.", donor);
         return false;
     }
 
-    // Selaraskan status streaming TXD slot ini jadi "LOADED" (id TXD = 20000 + slot), karena
-    // kita sudah memuatnya sendiri. Kalau tidak, game bisa memuat ulang TXD asli dari IMG.
+    // Selaraskan status streaming TXD slot ini jadi "LOADED" (id TXD = 20000 + slot).
     {
         unsigned char* st = (unsigned char*)(0x8E4CC0 + (20000 + (int)txdSlot) * 20 + 0x10);
         Log("MUAT: status streaming TXD %d sebelum = %u", 20000 + (int)txdSlot, (unsigned)*st);
@@ -316,14 +352,14 @@ static bool EnsureCustomDonor(int donor, bool force)
     }
 
     Log("MUAT: [6/8] LoadClumpFile(%s, %d)...", dffRel, donor);
-    // Di Plugin SDK, LoadClumpFile hanya menerima stream. Stream dibuka sendiri; TIDAK kita
-    // tutup dari sini (kalau game sudah menutupnya, menutup dua kali akan crash).
+    // Stream dibuka sendiri dan TIDAK ditutup dari sini (kalau game sudah menutupnya,
+    // menutup dua kali akan crash).
     RwStream* dffStream = RwStreamOpen(rwSTREAMFILENAME, rwSTREAMREAD, dffRel);
     Log("MUAT: stream DFF = %p", (void*)dffStream);
     if (!dffStream)
     {
-        g_donorBroken = true;
-        Log("MUAT: GAGAL membuka stream DFF. Donor ditandai rusak (restart game).");
+        slot.broken = true;
+        Log("MUAT: GAGAL membuka stream DFF. Donor %d ditandai rusak.", donor);
         return false;
     }
 
@@ -337,39 +373,164 @@ static bool EnsureCustomDonor(int donor, bool force)
     Log("MUAT: [7/8] LoadClumpFile selesai. clump baru = %08X", rwObj);
     if (rwObj == 0)
     {
-        g_donorBroken = true;
-        Log("MUAT: GAGAL memuat DFF (clump kosong). Donor ditandai rusak (restart game).");
+        slot.broken = true;
+        Log("MUAT: GAGAL memuat DFF (clump kosong). Donor %d ditandai rusak.", donor);
         return false;
     }
 
     CTxdStore::AddRef(txdSlot);   // menyeimbangkan RemoveRef yang dilakukan game saat model dibuang
-    g_customClump = rwObj;
-    Log("MUAT: [8/8] BERHASIL. Model custom terpasang di donor %d.", donor);
+    slot.clump = rwObj;
+    slot.modelIdx = modelIdx;
+    Log("MUAT: [8/8] BERHASIL. Model '%s' terpasang di donor %d.", file, donor);
     return true;
+}
+
+// Cari (atau siapkan) donor yang memegang model custom ke-modelIdx. Return indeks donor, -1 kalau gagal.
+static int AcquireDonorFor(int modelIdx)
+{
+    // 1) sudah ada donor yang memegang model ini?
+    for (int i = 0; i < g_donorCount; i++)
+    {
+        DonorSlot& s = g_donors[i];
+        if (s.broken || s.modelIdx != modelIdx) continue;
+
+        unsigned int miPtr = *(unsigned int*)(0xA9B0C8 + s.id * 4);
+        unsigned int rwObj = miPtr ? *(unsigned int*)(miPtr + 0x1C) : 0;
+        if (rwObj != 0 && rwObj == s.clump && GetLoadState(s.id) == 1)
+        {
+            Log("DONOR: model '%s' sudah ada di donor %d.", g_models[modelIdx], s.id);
+            return i;
+        }
+        // game membuang / memuat ulang model donor ini -> muat ulang file kita
+        Log("DONOR: donor %d berubah (dibuang/dimuat ulang oleh game), memuat ulang '%s'.", s.id, g_models[modelIdx]);
+        if (LoadModelIntoDonor(s, modelIdx)) return i;
+        return -1;
+    }
+
+    // 2) pakai donor kosong
+    for (int i = 0; i < g_donorCount; i++)
+    {
+        DonorSlot& s = g_donors[i];
+        if (s.broken || s.modelIdx != -1) continue;
+        Log("DONOR: memakai donor kosong %d untuk '%s'.", s.id, g_models[modelIdx]);
+        if (LoadModelIntoDonor(s, modelIdx)) return i;
+        // gagal: kalau slot tidak rusak, coba donor kosong berikutnya
+        if (s.broken) continue;
+        return -1;
+    }
+
+    Log("DONOR: kolam donor PENUH atau rusak semua. Tambahkan ID di Donors= pada INI.");
+    return -1;
+}
+
+static void LogPool()
+{
+    for (int i = 0; i < g_donorCount; i++)
+    {
+        DonorSlot& s = g_donors[i];
+        if (s.broken) Log("KOLAM: donor %d = RUSAK", s.id);
+        else if (s.modelIdx < 0) Log("KOLAM: donor %d = kosong", s.id);
+        else Log("KOLAM: donor %d = '%s'", s.id, g_models[s.modelIdx]);
+    }
 }
 
 static void OnLoadCustom()
 {
-    int donor = GetDonorModel();
-    if (g_swapVeh != nullptr)
-    {
-        Log("MUAT: ada kendaraan yang sedang ditukar. Kembalikan dulu dengan F11, lalu tekan INSERT lagi.");
-        return;
-    }
-    Log("MUAT: INSERT ditekan, donor = %d", donor);
-    EnsureCustomDonor(donor, true);
+    EnsureConfig();
+    Log("MUAT: INSERT ditekan: memuat semua model ke kolam donor.");
+    for (int m = 0; m < g_modelCount; m++)
+        AcquireDonorFor(m);
+    LogPool();
 }
 
 // ---------------------------------------------------------------- tukar model
-static int g_swapOriginal = 0;
+struct SwapEntry
+{
+    CVehicle* veh;
+    int original;    // model asli kendaraan sebelum ditukar
+    int donorId;     // ID donor yang sedang dipakai
+    int modelIdx;    // model custom yang sedang dipakai
+};
+static SwapEntry g_swaps[16];
+static int g_swapCount = 0;
 static int g_framesToWatch = 0;
+
+// Cari entri untuk kendaraan ini. Kalau entri ada tapi modelnya tidak cocok lagi (kendaraan lama
+// sudah dihancurkan dan alamatnya dipakai ulang), entri dianggap basi dan dibuang.
+static int FindSwap(CVehicle* veh)
+{
+    for (int i = 0; i < g_swapCount; i++)
+    {
+        if (g_swaps[i].veh != veh) continue;
+        if ((int)veh->m_nModelIndex == g_swaps[i].donorId) return i;
+
+        Log("TUKAR: entri basi untuk kendaraan %p dibuang.", (void*)veh);
+        g_swaps[i] = g_swaps[g_swapCount - 1];
+        g_swapCount--;
+        return -1;
+    }
+    return -1;
+}
+
+static void RemoveSwapAt(int i)
+{
+    g_swaps[i] = g_swaps[g_swapCount - 1];
+    g_swapCount--;
+}
+
+// Urutan tukar yang sudah terbukti: DeleteRwObject -> SetModelIndex -> SetupSuspensionLines.
+static bool PerformSwap(CVehicle* veh, int target)
+{
+    Log("SWAP: [1/5] pastikan model %d ter-load (status sebelum = %u)...", target, GetLoadState(target));
+    if (!EnsureModelLoaded(target))
+    {
+        Log("SWAP: model %d tidak ter-load, DIBATALKAN. Kendaraan tidak disentuh.", target);
+        return false;
+    }
+
+    LogColInfo("SWAP target", target);
+    if (GetColInfo(target).data == 0)
+    {
+        Log("SWAP: colData model target KOSONG, DIBATALKAN.");
+        return false;
+    }
+
+    DumpNodes(veh, "SWAP node SEBELUM");
+
+    Log("SWAP: [2/5] DeleteRwObject...");
+    veh->DeleteRwObject();
+
+    Log("SWAP: [3/5] SetModelIndex(%d)...", target);
+    veh->SetModelIndex(target);
+
+    Log("SWAP: [4/5] SetupSuspensionLines...");
+    static_cast<CAutomobile*>(veh)->SetupSuspensionLines();
+
+    LogColInfo("SWAP target SESUDAH", target);
+    DumpNodes(veh, "SWAP node SESUDAH");
+    Log("SWAP: [5/5] selesai. m_nModelIndex = %d. Menunggu 5 frame...", (int)veh->m_nModelIndex);
+    g_framesToWatch = 5;
+    return true;
+}
 
 static void OnSwap()
 {
+    EnsureConfig();
+
     CVehicle* veh = FindPlayerVehicle(-1, false);
     if (!veh)
     {
         Log("TUKAR: kamu tidak sedang di dalam kendaraan.");
+        return;
+    }
+    if (g_modelCount == 0)
+    {
+        Log("TUKAR: daftar Models= di INI kosong. Isi dulu, contoh: Models=infernus");
+        return;
+    }
+    if (g_donorCount == 0)
+    {
+        Log("TUKAR: daftar Donors= di INI kosong / tidak valid.");
         return;
     }
 
@@ -380,78 +541,49 @@ static void OnSwap()
         return;
     }
 
-    bool restoring = (g_swapVeh == veh && g_swapOriginal != 0);
-    int donor = GetDonorModel();
-    int target = restoring ? g_swapOriginal : ((current == donor) ? 411 : donor);
-    if (!restoring) Log("TUKAR: donor dari INI = %d", donor);
+    int e = FindSwap(veh);
+    int original = (e >= 0) ? g_swaps[e].original : current;
+    int nextIdx = (e >= 0) ? g_swaps[e].modelIdx + 1 : 0;
 
-    // B1b: pastikan model custom dari file sudah terpasang di donor (hanya kalau mau menukar KE donor)
-    if (!restoring && target == donor)
+    if (nextIdx >= g_modelCount)
     {
-        if (!EnsureCustomDonor(donor, false))
-        {
-            Log("TUKAR: model custom donor belum siap, tukar DIBATALKAN. Kendaraan tidak disentuh.");
-            return;
-        }
-    }
-
-    Log("TUKAR: %s model %d -> %d", restoring ? "KEMBALIKAN" : "TUKAR", current, target);
-
-    // 1. pastikan model target ter-load. Kalau tidak, batalkan (tidak menyentuh kendaraan).
-    Log("TUKAR: [1/6] status model %d sebelum request = %u", target, GetLoadState(target));
-    CStreaming::RequestModel(target, 2);
-    for (int i = 0; i < 10 && GetLoadState(target) != 1; i++)
-        CStreaming::LoadAllRequestedModels(false);
-
-    unsigned int st = GetLoadState(target);
-    Log("TUKAR: [2/6] status model %d setelah load = %u (harus 1)", target, st);
-    if (st != 1)
-    {
-        Log("TUKAR: model belum ter-load, DIBATALKAN. Kendaraan tidak disentuh.");
+        // putaran habis -> kembalikan ke model asli
+        Log("TUKAR: KEMBALIKAN ke model asli %d", original);
+        if (PerformSwap(veh, original) && e >= 0)
+            RemoveSwapAt(e);
         return;
     }
 
-    // 2. cek data collision (dugaan penyebab crash: colData model target kosong)
-    LogColInfo("TUKAR asal  ", current);
-    LogColInfo("TUKAR target", target);
-    if (GetColInfo(target).data == 0)
+    Log("TUKAR: model custom #%d '%s' (model asli kendaraan = %d)", nextIdx, g_models[nextIdx], original);
+    int slotIdx = AcquireDonorFor(nextIdx);
+    if (slotIdx < 0)
     {
-        Log("TUKAR: colData model target KOSONG. DIBATALKAN supaya game tidak crash.");
+        Log("TUKAR: model custom belum siap, tukar DIBATALKAN. Kendaraan tidak disentuh.");
         return;
     }
+    int target = g_donors[slotIdx].id;
 
-    // 3. tukar
-    DumpNodes(veh, "TUKAR node SEBELUM");
+    if (!PerformSwap(veh, target))
+        return;
 
-    Log("TUKAR: [3/6] memanggil DeleteRwObject...");
-    veh->DeleteRwObject();
-
-    Log("TUKAR: [4/6] DeleteRwObject selesai. Memanggil SetModelIndex(%d)...", target);
-    veh->SetModelIndex(target);
-
-    Log("TUKAR: [5/7] SetModelIndex selesai. m_nModelIndex = %d", (int)veh->m_nModelIndex);
-
-    // Dugaan penyebab crash: suspension lines belum disiapkan untuk model baru.
-    // Game memanggil ini sendiri saat membuat mobil baru; kita meniru urutan itu.
-    Log("TUKAR: [6/7] memanggil SetupSuspensionLines...");
-    static_cast<CAutomobile*>(veh)->SetupSuspensionLines();
-    Log("TUKAR: SetupSuspensionLines selesai");
-    LogColInfo("TUKAR target SESUDAH", target);
-    DumpNodes(veh, "TUKAR node SESUDAH");
-
-    Log("TUKAR: [7/7] selesai. Menunggu 5 frame untuk memastikan game selamat...");
-    g_framesToWatch = 5;
-
-    if (restoring)
+    if (e >= 0)
     {
-        g_swapVeh = nullptr;
-        g_swapOriginal = 0;
+        g_swaps[e].donorId = target;
+        g_swaps[e].modelIdx = nextIdx;
+    }
+    else if (g_swapCount < 16)
+    {
+        g_swaps[g_swapCount].veh = veh;
+        g_swaps[g_swapCount].original = original;
+        g_swaps[g_swapCount].donorId = target;
+        g_swaps[g_swapCount].modelIdx = nextIdx;
+        g_swapCount++;
     }
     else
     {
-        g_swapVeh = veh;
-        g_swapOriginal = current;
+        Log("TUKAR: catatan penukaran penuh (16), kendaraan ini tidak bisa dikembalikan otomatis.");
     }
+    LogPool();
 }
 
 // ---------------------------------------------------------------- tes isolasi (model yang sama)
@@ -550,13 +682,11 @@ static DWORD WINAPI KeyThread(LPVOID)
             Log("tombol TUKAR (F11) terdeteksi");
             InterlockedExchange(&g_pendSwap, 1);
         }
-
         if (q && !selfWas)
         {
             Log("tombol ISOLASI (F12) terdeteksi");
             InterlockedExchange(&g_pendSelf, 1);
         }
-
         if (l && !loadWas)
         {
             Log("tombol MUAT (INSERT) terdeteksi");
@@ -576,7 +706,7 @@ class CustomVehiclesPlugin
 public:
     CustomVehiclesPlugin()
     {
-        Log("=== CustomVehicles (tahap 1, B1b: INSERT muat dari file, F10 baca, F11 tukar ke donor, F12 isolasi) ter-load ===");
+        Log("=== CustomVehicles (B1c: kolam donor; INSERT muat, F10 baca, F11 tukar/siklus, F12 isolasi) ter-load ===");
         plugin::Events::gameProcessEvent.before += OnGameProcess;
         plugin::Events::drawingEvent += OnDrawing;
 
