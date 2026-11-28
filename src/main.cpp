@@ -1,19 +1,30 @@
-// CustomVehicles - TAHAP B1c (kolam donor: banyak model custom, dimuat dari FILE, tanpa modloader)
+// CustomVehicles - TAHAP B2 (kelas donor + unduh model dari server ke cache bersama)
 //
-//  INSERT = MUAT semua model di daftar Models= ke kolam donor (diagnostik / preload).
+//  INSERT = MUAT semua model yang sudah siap ke kolam donor (diagnostik / preload).
 //  F10    = BACA SAJA (aman): catat model kendaraan yang sedang kamu naiki + data handling.
 //  F11    = TUKAR: ganti kendaraan yang kamu naiki ke model custom berikutnya di daftar.
-//           Tekan lagi untuk model custom berikutnya; setelah model terakhir, kembali ke model asli.
+//           Tekan lagi untuk model berikutnya; setelah model terakhir, kembali ke model asli.
 //  F12    = TES ISOLASI: tukar ke model yang SAMA (untuk membedakan masalah urutan vs masalah data).
 //
-// Konfigurasi di CustomVehicles.ini (folder GTA):
-//   Donors=503,502,494,504     <- slot kendaraan yang TIDAK dipakai servermu (400-611)
-//   Models=infernus,r32        <- file CustomVehicles\<nama>.dff dan .txd
+// Konfigurasi di CustomVehicles.ini (folder GTA). Dua mode:
+//   MODE LOKAL (tanpa BaseUrl): model dibaca dari folder GTA\CustomVehicles\<nama>.dff/.txd
+//   MODE UNDUH (BaseUrl diisi): plugin mengunduh BaseUrl/manifest.txt, lalu file model yang
+//     belum ada di cache. Cache bersama (satu tempat untuk semua server), nama file berbentuk
+//     0x<CRC32>.dff / .txd, default: Dokumen\GTA San Andreas User Files\SAMP\cache\CustomVehicles
+//
+// Donor punya kelas (Donors=503:sport,504:sedan). Model custom hanya dipasang di donor yang
+// sekelas, supaya hitbox cocok. Kelas kosong = cocok dengan semua.
 //
 // (F1, Tab, F4, F5, F7, F8, F9, T/F6, G sudah dipakai SA-MP, jadi dihindari.)
 //
 // Batasan versi ini: model yang sudah dimuat ke sebuah donor tidak dibuang lagi selama game
 // berjalan (belum ada "eviction"). Jumlah model berbeda yang bisa dipakai = jumlah donor.
+// Verifikasi unduhan memakai CRC32 (cek kerusakan file, bukan perlindungan dari pemalsuan).
+
+// Mode unduh dari server (WinHTTP + cache bersama).
+//   0 = NONAKTIF (default): bagian unduh tidak ikut dikompilasi. Hanya mode lokal.
+//   1 = AKTIF: ubah angka ini jadi 1 kalau mau mencoba mode unduh (belum teruji).
+#define CV_ENABLE_DOWNLOAD 0
 
 #include "plugin.h"
 #include "game_sa/common.h"
@@ -25,10 +36,19 @@
 #include "game_sa/CStreaming.h"
 
 #include <windows.h>
+#if CV_ENABLE_DOWNLOAD
+#include <winhttp.h>
+#include <shlobj.h>
+#endif
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
 #include <cstdlib>
+#include <vector>
+
+#if CV_ENABLE_DOWNLOAD
+#pragma comment(lib, "winhttp.lib")
+#endif
 
 static void GetGameDir(char* out, size_t size)
 {
@@ -194,16 +214,27 @@ static const int MAX_MODELS = 32;
 struct DonorSlot
 {
     int id;                 // ID model kendaraan yang dipakai sebagai wadah (400-611)
+    char cls[16];           // kelas donor (sport, sedan, ...), kosong = cocok dengan semua
     int modelIdx;           // indeks di g_models yang sedang dimuat di slot ini, -1 = kosong
     unsigned int clump;     // pointer clump custom yang terpasang (untuk mendeteksi kalau dibuang game)
     bool broken;            // true kalau muat gagal di tengah jalan (slot tidak aman)
 };
 
+struct ModelDef
+{
+    char name[64];
+    char cls[16];           // kelas model, kosong = boleh di donor mana saja
+    char dffPath[MAX_PATH]; // relatif ke folder GTA (mode lokal) atau absolut (cache unduhan)
+    char txdPath[MAX_PATH];
+};
+
 static DonorSlot g_donors[MAX_DONORS];
 static int g_donorCount = 0;
-static char g_models[MAX_MODELS][64];
-static int g_modelCount = 0;
-static bool g_configLoaded = false;
+static ModelDef g_models[MAX_MODELS];
+static volatile LONG g_modelCount = 0;     // hanya model yang SUDAH SIAP yang dihitung
+static volatile LONG g_configReady = 0;
+static char g_baseUrl[512] = {0};
+static char g_cacheDir[MAX_PATH] = {0};
 
 static void ReadIni(const char* key, char* out, size_t size)
 {
@@ -232,14 +263,244 @@ static void ParseCsv(const char* src, char out[][64], int maxItems, int& count)
     }
 }
 
+// "503:sport" -> tok jadi "503", cls = "sport"
+static void SplitClass(char* tok, char* cls, size_t clsSize)
+{
+    cls[0] = 0;
+    char* colon = strchr(tok, ':');
+    if (colon)
+    {
+        *colon = 0;
+        strncpy_s(cls, clsSize, colon + 1, _TRUNCATE);
+        _strlwr_s(cls, clsSize);
+    }
+}
+
+static bool ClassMatches(const char* a, const char* b)
+{
+    if (!a[0] || !b[0]) return true;
+    return _stricmp(a, b) == 0;
+}
+
+#if CV_ENABLE_DOWNLOAD
+// ---------------------------------------------------------------- unduh (WinHTTP) + CRC32 + cache
+static unsigned int Crc32(const unsigned char* d, size_t n)
+{
+    static unsigned int table[256];
+    static bool init = false;
+    if (!init)
+    {
+        for (unsigned int i = 0; i < 256; i++)
+        {
+            unsigned int c = i;
+            for (int k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            table[i] = c;
+        }
+        init = true;
+    }
+    unsigned int c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++) c = table[(c ^ d[i]) & 0xFF] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+}
+
+static bool ReadFileAll(const char* path, std::vector<unsigned char>& out)
+{
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "rb") != 0 || !f) return false;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size < 0) { fclose(f); return false; }
+    out.resize((size_t)size);
+    size_t got = size ? fread(out.data(), 1, (size_t)size, f) : 0;
+    fclose(f);
+    return got == (size_t)size;
+}
+
+static bool WriteFileAll(const char* path, const std::vector<unsigned char>& data)
+{
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "wb") != 0 || !f) return false;
+    size_t put = data.empty() ? 0 : fwrite(data.data(), 1, data.size(), f);
+    fclose(f);
+    return put == data.size();
+}
+
+// GET sederhana lewat WinHTTP. Dipanggil HANYA dari thread kerja (tidak boleh dari thread game).
+static bool HttpGet(const char* url, std::vector<unsigned char>& out)
+{
+    wchar_t wurl[2048];
+    if (!MultiByteToWideChar(CP_UTF8, 0, url, -1, wurl, 2048)) return false;
+
+    wchar_t host[256] = {0};
+    wchar_t path[1792] = {0};
+    URL_COMPONENTS uc;
+    memset(&uc, 0, sizeof(uc));
+    uc.dwStructSize = sizeof(uc);
+    uc.lpszHostName = host;
+    uc.dwHostNameLength = 256;
+    uc.lpszUrlPath = path;
+    uc.dwUrlPathLength = 1792;
+    if (!WinHttpCrackUrl(wurl, 0, 0, &uc)) { Log("HTTP: URL tidak valid: %s", url); return false; }
+
+    HINTERNET session = WinHttpOpen(L"CustomVehicles/0.2", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!session) return false;
+    WinHttpSetTimeouts(session, 10000, 10000, 30000, 60000);
+
+    bool ok = false;
+    HINTERNET conn = WinHttpConnect(session, host, uc.nPort, 0);
+    if (conn)
+    {
+        DWORD flags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+        HINTERNET req = WinHttpOpenRequest(conn, L"GET", path, NULL, WINHTTP_NO_REFERER,
+                                           WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+        if (req)
+        {
+            if (WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+                WinHttpReceiveResponse(req, NULL))
+            {
+                DWORD status = 0, size = sizeof(status);
+                WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                    WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX);
+                if (status == 200)
+                {
+                    ok = true;
+                    for (;;)
+                    {
+                        DWORD avail = 0;
+                        if (!WinHttpQueryDataAvailable(req, &avail)) { ok = false; break; }
+                        if (avail == 0) break;
+                        size_t old = out.size();
+                        if (old + avail > 64u * 1024u * 1024u) { Log("HTTP: file terlalu besar, dibatalkan."); ok = false; break; }
+                        out.resize(old + avail);
+                        DWORD got = 0;
+                        if (!WinHttpReadData(req, out.data() + old, avail, &got)) { ok = false; break; }
+                        out.resize(old + got);
+                    }
+                }
+                else
+                {
+                    Log("HTTP: status %lu untuk %s", (unsigned long)status, url);
+                }
+            }
+            WinHttpCloseHandle(req);
+        }
+        WinHttpCloseHandle(conn);
+    }
+    WinHttpCloseHandle(session);
+    return ok;
+}
+
+// Pastikan file ada di cache dengan CRC yang benar. Unduh kalau belum / rusak.
+static bool EnsureCached(const char* url, unsigned int expectedCrc, const char* dest)
+{
+    std::vector<unsigned char> buf;
+    if (ReadFileAll(dest, buf) && Crc32(buf.data(), buf.size()) == expectedCrc)
+    {
+        Log("CACHE: sudah ada & CRC cocok: %s", dest);
+        return true;
+    }
+
+    Log("UNDUH: %s", url);
+    buf.clear();
+    if (!HttpGet(url, buf))
+    {
+        Log("UNDUH: GAGAL mengunduh %s", url);
+        return false;
+    }
+    unsigned int crc = Crc32(buf.data(), buf.size());
+    if (crc != expectedCrc)
+    {
+        Log("UNDUH: CRC TIDAK COCOK (%08X, seharusnya %08X) untuk %s. File dibuang.", crc, expectedCrc, url);
+        return false;
+    }
+
+    char tmp[MAX_PATH];
+    sprintf_s(tmp, "%s.part", dest);
+    if (!WriteFileAll(tmp, buf) || !MoveFileExA(tmp, dest, MOVEFILE_REPLACE_EXISTING))
+    {
+        Log("UNDUH: gagal menyimpan ke cache: %s", dest);
+        DeleteFileA(tmp);
+        return false;
+    }
+    Log("UNDUH: OK (%u byte) -> %s", (unsigned)buf.size(), dest);
+    return true;
+}
+
+// Baca manifest.txt dan unduh semua model di dalamnya. Format tiap baris:
+//   nama,kelas,crcDff,crcTxd      (kelas "-" = bebas; CRC heksadesimal, contoh 1A2B3C4D)
+static void SyncRemote()
+{
+    char url[1024];
+    sprintf_s(url, "%s/manifest.txt", g_baseUrl);
+    Log("UNDUH: mengambil manifest: %s", url);
+
+    std::vector<unsigned char> data;
+    if (!HttpGet(url, data))
+    {
+        Log("UNDUH: gagal mengambil manifest. Tidak ada model dari server.");
+        return;
+    }
+    data.push_back(0);
+
+    SHCreateDirectoryExA(NULL, g_cacheDir, NULL);
+
+    char* ctxLine = nullptr;
+    int lineNo = 0;
+    for (char* line = strtok_s((char*)data.data(), "\n", &ctxLine); line; line = strtok_s(nullptr, "\n", &ctxLine))
+    {
+        lineNo++;
+        while (*line == ' ' || *line == '\t') line++;
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\r' || line[len - 1] == ' ' || line[len - 1] == '\t')) line[--len] = 0;
+        if (!*line || *line == '#') continue;
+
+        if (g_modelCount >= MAX_MODELS) { Log("UNDUH: daftar model penuh (%d).", MAX_MODELS); break; }
+
+        char* ctx = nullptr;
+        char* name = strtok_s(line, ",", &ctx);
+        char* cls  = strtok_s(nullptr, ",", &ctx);
+        char* sd   = strtok_s(nullptr, ",", &ctx);
+        char* st   = strtok_s(nullptr, ",", &ctx);
+        if (!name || !cls || !sd || !st)
+        {
+            Log("MANIFEST: baris %d tidak valid, dilewati.", lineNo);
+            continue;
+        }
+        unsigned int dffCrc = (unsigned int)strtoul(sd, nullptr, 16);
+        unsigned int txdCrc = (unsigned int)strtoul(st, nullptr, 16);
+
+        ModelDef& m = g_models[g_modelCount];     // hanya thread ini yang menulis; diterbitkan di akhir
+        memset(&m, 0, sizeof(m));
+        strncpy_s(m.name, sizeof(m.name), name, _TRUNCATE);
+        if (strcmp(cls, "-") != 0) { strncpy_s(m.cls, sizeof(m.cls), cls, _TRUNCATE); _strlwr_s(m.cls, sizeof(m.cls)); }
+        sprintf_s(m.dffPath, "%s\\0x%08X.dff", g_cacheDir, dffCrc);
+        sprintf_s(m.txdPath, "%s\\0x%08X.txd", g_cacheDir, txdCrc);
+
+        char urlDff[1024], urlTxd[1024];
+        sprintf_s(urlDff, "%s/%s.dff", g_baseUrl, name);
+        sprintf_s(urlTxd, "%s/%s.txd", g_baseUrl, name);
+
+        Log("MANIFEST: model '%s' kelas '%s'", m.name, m.cls[0] ? m.cls : "(bebas)");
+        if (!EnsureCached(urlDff, dffCrc, m.dffPath)) continue;
+        if (!EnsureCached(urlTxd, txdCrc, m.txdPath)) continue;
+
+        InterlockedIncrement(&g_modelCount);       // terbitkan: model ini siap dipakai thread game
+        Log("MANIFEST: model '%s' SIAP.", m.name);
+    }
+    Log("UNDUH: selesai. %ld model siap.", (long)g_modelCount);
+}
+
+#endif  // CV_ENABLE_DOWNLOAD
+
+// ---------------------------------------------------------------- konfigurasi
+// Dijalankan SEKALI oleh thread kerja (bukan dari DllMain / thread game).
 static void EnsureConfig()
 {
-    if (g_configLoaded) return;
-    g_configLoaded = true;
-
     char buf[512] = {0};
 
-    // donor: Donors=503,502 (atau format lama Donor=503)
+    // donor: Donors=503:sport,504:sedan   (atau tanpa kelas: 503,504; format lama Donor=503)
     ReadIni("Donors", buf, sizeof(buf));
     if (!buf[0])
     {
@@ -253,27 +514,94 @@ static void EnsureConfig()
     ParseCsv(buf, tmp, MAX_DONORS, n);
     for (int i = 0; i < n; i++)
     {
+        char cls[16];
+        SplitClass(tmp[i], cls, sizeof(cls));
         int id = atoi(tmp[i]);
         if (id < 400 || id > 611) { Log("KONFIG: donor '%s' tidak valid (harus 400-611), dilewati.", tmp[i]); continue; }
         bool dup = false;
         for (int j = 0; j < g_donorCount; j++) if (g_donors[j].id == id) dup = true;
         if (dup) continue;
         g_donors[g_donorCount].id = id;
+        strncpy_s(g_donors[g_donorCount].cls, sizeof(g_donors[g_donorCount].cls), cls, _TRUNCATE);
         g_donors[g_donorCount].modelIdx = -1;
         g_donors[g_donorCount].clump = 0;
         g_donors[g_donorCount].broken = false;
         g_donorCount++;
     }
 
-    // model: Models=infernus,r32 (atau format lama File=infernus)
-    memset(buf, 0, sizeof(buf));
-    ReadIni("Models", buf, sizeof(buf));
-    if (!buf[0]) ReadIni("File", buf, sizeof(buf));
-    ParseCsv(buf, g_models, MAX_MODELS, g_modelCount);
+#if CV_ENABLE_DOWNLOAD
+    ReadIni("BaseUrl", g_baseUrl, sizeof(g_baseUrl));
+    size_t bl = strlen(g_baseUrl);
+    while (bl > 0 && (g_baseUrl[bl - 1] == '/' || g_baseUrl[bl - 1] == '\\' || g_baseUrl[bl - 1] == ' ')) g_baseUrl[--bl] = 0;
+#else
+    {
+        char probe[8] = {0};
+        ReadIni("BaseUrl", probe, sizeof(probe));
+        if (probe[0])
+            Log("KONFIG: BaseUrl diisi, tetapi build ini TANPA fitur unduh (CV_ENABLE_DOWNLOAD=0). Memakai mode lokal.");
+    }
+#endif
 
-    Log("KONFIG: %d donor, %d model custom.", g_donorCount, g_modelCount);
-    for (int i = 0; i < g_donorCount; i++) Log("KONFIG: donor[%d] = model %d", i, g_donors[i].id);
-    for (int i = 0; i < g_modelCount; i++) Log("KONFIG: model[%d] = %s", i, g_models[i]);
+    if (g_baseUrl[0])
+    {
+#if CV_ENABLE_DOWNLOAD
+        // MODE UNDUH: cache bersama
+        ReadIni("CacheDir", g_cacheDir, sizeof(g_cacheDir));
+        if (!g_cacheDir[0])
+        {
+            char docs[MAX_PATH] = {0};
+            if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_PERSONAL, NULL, SHGFP_TYPE_CURRENT, docs)))
+                sprintf_s(g_cacheDir, "%s\\GTA San Andreas User Files\\SAMP\\cache\\CustomVehicles", docs);
+            else
+                strcpy_s(g_cacheDir, "CustomVehicles\\cache");
+        }
+        Log("KONFIG: MODE UNDUH. BaseUrl = %s", g_baseUrl);
+        Log("KONFIG: folder cache = %s", g_cacheDir);
+#endif
+    }
+    else
+    {
+        // MODE LOKAL: Models=infernus:sport,Skyline:sport  (atau format lama File=infernus)
+        memset(buf, 0, sizeof(buf));
+        ReadIni("Models", buf, sizeof(buf));
+        if (!buf[0]) ReadIni("File", buf, sizeof(buf));
+        char names[MAX_MODELS][64];
+        int mc = 0;
+        ParseCsv(buf, names, MAX_MODELS, mc);
+
+        char dir[MAX_PATH] = {0};
+        GetGameDir(dir, sizeof(dir));
+        for (int i = 0; i < mc && g_modelCount < MAX_MODELS; i++)
+        {
+            char cls[16];
+            SplitClass(names[i], cls, sizeof(cls));
+            ModelDef& m = g_models[g_modelCount];
+            memset(&m, 0, sizeof(m));
+            strncpy_s(m.name, sizeof(m.name), names[i], _TRUNCATE);
+            strncpy_s(m.cls, sizeof(m.cls), cls, _TRUNCATE);
+            sprintf_s(m.dffPath, "CustomVehicles\\%s.dff", m.name);
+            sprintf_s(m.txdPath, "CustomVehicles\\%s.txd", m.name);
+
+            char fullDff[MAX_PATH], fullTxd[MAX_PATH];
+            sprintf_s(fullDff, "%s\\%s", dir, m.dffPath);
+            sprintf_s(fullTxd, "%s\\%s", dir, m.txdPath);
+            if (!FileExistsA(fullDff) || !FileExistsA(fullTxd))
+            {
+                Log("KONFIG: file model '%s' tidak lengkap (%s / %s), dilewati.", m.name, fullDff, fullTxd);
+                continue;
+            }
+            InterlockedIncrement(&g_modelCount);
+        }
+        Log("KONFIG: MODE LOKAL.");
+    }
+
+    Log("KONFIG: %d donor, %ld model siap.", g_donorCount, (long)g_modelCount);
+    for (int i = 0; i < g_donorCount; i++)
+        Log("KONFIG: donor[%d] = model %d kelas '%s'", i, g_donors[i].id, g_donors[i].cls[0] ? g_donors[i].cls : "(bebas)");
+    for (int i = 0; i < (int)g_modelCount; i++)
+        Log("KONFIG: model[%d] = %s kelas '%s'", i, g_models[i].name, g_models[i].cls[0] ? g_models[i].cls : "(bebas)");
+
+    InterlockedExchange(&g_configReady, 1);
 }
 
 // ---------------------------------------------------------------- muat model dari file ke sebuah donor
@@ -285,29 +613,71 @@ static bool EnsureModelLoaded(int modelId)
     return GetLoadState(modelId) == 1;
 }
 
+// Menyiapkan path yang bisa dibuka loader game. Path relatif (mode lokal) dipakai apa adanya.
+// Path absolut (cache) dicoba dibuka lewat RenderWare; kalau tidak bisa, file disalin ke
+// folder game (CustomVehicles\cache) dan path relatif dipakai.
+static bool ResolveLoadPath(const char* path, char* out, size_t outSize, const char* gameDir)
+{
+    bool absolute = (path[0] && path[1] == ':') || (path[0] == '\\' && path[1] == '\\');
+    if (!absolute)
+    {
+        char full[MAX_PATH];
+        sprintf_s(full, "%s\\%s", gameDir, path);
+        if (!FileExistsA(full)) { Log("MUAT: file tidak ditemukan: %s", full); return false; }
+        strncpy_s(out, outSize, path, _TRUNCATE);
+        return true;
+    }
+
+#if CV_ENABLE_DOWNLOAD
+    if (!FileExistsA(path)) { Log("MUAT: file cache tidak ditemukan: %s", path); return false; }
+
+    RwStream* probe = RwStreamOpen(rwSTREAMFILENAME, rwSTREAMREAD, path);
+    if (probe)
+    {
+        RwStreamClose(probe, nullptr);
+        strncpy_s(out, outSize, path, _TRUNCATE);
+        return true;
+    }
+
+    Log("MUAT: path absolut tidak bisa dibuka RenderWare, menyalin ke folder game...");
+    char dirAbs[MAX_PATH];
+    sprintf_s(dirAbs, "%s\\CustomVehicles\\cache", gameDir);
+    SHCreateDirectoryExA(NULL, dirAbs, NULL);
+    const char* base = strrchr(path, '\\');
+    base = base ? base + 1 : path;
+    char rel[MAX_PATH], dst[MAX_PATH];
+    sprintf_s(rel, "CustomVehicles\\cache\\%s", base);
+    sprintf_s(dst, "%s\\%s", gameDir, rel);
+    if (!CopyFileA(path, dst, FALSE))
+    {
+        Log("MUAT: gagal menyalin %s -> %s", path, dst);
+        return false;
+    }
+    strncpy_s(out, outSize, rel, _TRUNCATE);
+    return true;
+#else
+    Log("MUAT: path absolut tidak didukung di build ini (CV_ENABLE_DOWNLOAD=0): %s", path);
+    return false;
+#endif
+}
+
 // Mengganti isi model donor dengan model dari file memakai loader bawaan game.
 // Kalau gagal SEBELUM ada yang diubah: return false, slot tetap aman.
 // Kalau gagal SETELAH ada yang diubah: slot ditandai rusak.
 static bool LoadModelIntoDonor(DonorSlot& slot, int modelIdx)
 {
-    const char* file = g_models[modelIdx];
+    const ModelDef& model = g_models[modelIdx];
     int donor = slot.id;
 
     char dir[MAX_PATH] = {0};
     GetGameDir(dir, sizeof(dir));
 
-    char dffRel[MAX_PATH], txdRel[MAX_PATH], dffFull[MAX_PATH], txdFull[MAX_PATH];
-    sprintf_s(dffRel, "CustomVehicles\\%s.dff", file);
-    sprintf_s(txdRel, "CustomVehicles\\%s.txd", file);
-    sprintf_s(dffFull, "%s\\%s", dir, dffRel);
-    sprintf_s(txdFull, "%s\\%s", dir, txdRel);
-
-    Log("MUAT[%s -> donor %d]: [1/8] cek file...", file, donor);
-    if (!FileExistsA(dffFull) || !FileExistsA(txdFull))
-    {
-        Log("MUAT: file tidak ditemukan: %s / %s", dffFull, txdFull);
-        return false;
-    }
+    Log("MUAT[%s -> donor %d]: [1/8] siapkan path file...", model.name, donor);
+    char dffUse[MAX_PATH], txdUse[MAX_PATH];
+    if (!ResolveLoadPath(model.dffPath, dffUse, sizeof(dffUse), dir)) return false;
+    if (!ResolveLoadPath(model.txdPath, txdUse, sizeof(txdUse), dir)) return false;
+    Log("MUAT: DFF = %s", dffUse);
+    Log("MUAT: TXD = %s", txdUse);
 
     Log("MUAT: [2/8] pastikan model donor %d (versi asli) ter-load...", donor);
     if (!EnsureModelLoaded(donor))
@@ -334,8 +704,8 @@ static bool LoadModelIntoDonor(DonorSlot& slot, int modelIdx)
     Log("MUAT: [4/8] RemoveTxd(%d) (buang TXD lama)...", (int)txdSlot);
     CTxdStore::RemoveTxd(txdSlot);
 
-    Log("MUAT: [5/8] LoadTxd(%d, %s)...", (int)txdSlot, txdRel);
-    bool okTxd = CTxdStore::LoadTxd(txdSlot, txdRel);
+    Log("MUAT: [5/8] LoadTxd(%d)...", (int)txdSlot);
+    bool okTxd = CTxdStore::LoadTxd(txdSlot, txdUse);
     Log("MUAT: LoadTxd hasil = %d", okTxd ? 1 : 0);
     if (!okTxd)
     {
@@ -351,10 +721,10 @@ static bool LoadModelIntoDonor(DonorSlot& slot, int modelIdx)
         *st = 1;
     }
 
-    Log("MUAT: [6/8] LoadClumpFile(%s, %d)...", dffRel, donor);
+    Log("MUAT: [6/8] LoadClumpFile(%d)...", donor);
     // Stream dibuka sendiri dan TIDAK ditutup dari sini (kalau game sudah menutupnya,
     // menutup dua kali akan crash).
-    RwStream* dffStream = RwStreamOpen(rwSTREAMFILENAME, rwSTREAMREAD, dffRel);
+    RwStream* dffStream = RwStreamOpen(rwSTREAMFILENAME, rwSTREAMREAD, dffUse);
     Log("MUAT: stream DFF = %p", (void*)dffStream);
     if (!dffStream)
     {
@@ -381,13 +751,15 @@ static bool LoadModelIntoDonor(DonorSlot& slot, int modelIdx)
     CTxdStore::AddRef(txdSlot);   // menyeimbangkan RemoveRef yang dilakukan game saat model dibuang
     slot.clump = rwObj;
     slot.modelIdx = modelIdx;
-    Log("MUAT: [8/8] BERHASIL. Model '%s' terpasang di donor %d.", file, donor);
+    Log("MUAT: [8/8] BERHASIL. Model '%s' terpasang di donor %d.", model.name, donor);
     return true;
 }
 
 // Cari (atau siapkan) donor yang memegang model custom ke-modelIdx. Return indeks donor, -1 kalau gagal.
 static int AcquireDonorFor(int modelIdx)
 {
+    const ModelDef& model = g_models[modelIdx];
+
     // 1) sudah ada donor yang memegang model ini?
     for (int i = 0; i < g_donorCount; i++)
     {
@@ -398,28 +770,35 @@ static int AcquireDonorFor(int modelIdx)
         unsigned int rwObj = miPtr ? *(unsigned int*)(miPtr + 0x1C) : 0;
         if (rwObj != 0 && rwObj == s.clump && GetLoadState(s.id) == 1)
         {
-            Log("DONOR: model '%s' sudah ada di donor %d.", g_models[modelIdx], s.id);
+            Log("DONOR: model '%s' sudah ada di donor %d.", model.name, s.id);
             return i;
         }
         // game membuang / memuat ulang model donor ini -> muat ulang file kita
-        Log("DONOR: donor %d berubah (dibuang/dimuat ulang oleh game), memuat ulang '%s'.", s.id, g_models[modelIdx]);
+        Log("DONOR: donor %d berubah (dibuang/dimuat ulang oleh game), memuat ulang '%s'.", s.id, model.name);
         if (LoadModelIntoDonor(s, modelIdx)) return i;
         return -1;
     }
 
-    // 2) pakai donor kosong
+    // 2) pakai donor kosong yang SEKELAS
+    bool classFull = true;
     for (int i = 0; i < g_donorCount; i++)
     {
         DonorSlot& s = g_donors[i];
         if (s.broken || s.modelIdx != -1) continue;
-        Log("DONOR: memakai donor kosong %d untuk '%s'.", s.id, g_models[modelIdx]);
+        if (!ClassMatches(model.cls, s.cls)) continue;
+        classFull = false;
+        Log("DONOR: memakai donor kosong %d (kelas '%s') untuk '%s' (kelas '%s').",
+            s.id, s.cls[0] ? s.cls : "(bebas)", model.name, model.cls[0] ? model.cls : "(bebas)");
         if (LoadModelIntoDonor(s, modelIdx)) return i;
-        // gagal: kalau slot tidak rusak, coba donor kosong berikutnya
-        if (s.broken) continue;
+        if (s.broken) continue;    // rusak -> coba donor sekelas berikutnya
         return -1;
     }
 
-    Log("DONOR: kolam donor PENUH atau rusak semua. Tambahkan ID di Donors= pada INI.");
+    if (classFull)
+        Log("DONOR: tidak ada donor kosong yang sekelas dengan '%s' (kelas '%s'). Tambahkan donor kelas itu di Donors=.",
+            model.name, model.cls[0] ? model.cls : "(bebas)");
+    else
+        Log("DONOR: semua donor sekelas untuk '%s' gagal / rusak.", model.name);
     return -1;
 }
 
@@ -428,17 +807,28 @@ static void LogPool()
     for (int i = 0; i < g_donorCount; i++)
     {
         DonorSlot& s = g_donors[i];
-        if (s.broken) Log("KOLAM: donor %d = RUSAK", s.id);
-        else if (s.modelIdx < 0) Log("KOLAM: donor %d = kosong", s.id);
-        else Log("KOLAM: donor %d = '%s'", s.id, g_models[s.modelIdx]);
+        const char* c = s.cls[0] ? s.cls : "(bebas)";
+        if (s.broken) Log("KOLAM: donor %d [%s] = RUSAK", s.id, c);
+        else if (s.modelIdx < 0) Log("KOLAM: donor %d [%s] = kosong", s.id, c);
+        else Log("KOLAM: donor %d [%s] = '%s'", s.id, c, g_models[s.modelIdx].name);
     }
+}
+
+static bool ConfigOk(const char* who)
+{
+    if (!g_configReady)
+    {
+        Log("%s: konfigurasi belum siap (thread kerja masih berjalan). Coba lagi sebentar.", who);
+        return false;
+    }
+    return true;
 }
 
 static void OnLoadCustom()
 {
-    EnsureConfig();
-    Log("MUAT: INSERT ditekan: memuat semua model ke kolam donor.");
-    for (int m = 0; m < g_modelCount; m++)
+    if (!ConfigOk("MUAT")) return;
+    Log("MUAT: INSERT ditekan: memuat semua model yang siap ke kolam donor (%ld model).", (long)g_modelCount);
+    for (int m = 0; m < (int)g_modelCount; m++)
         AcquireDonorFor(m);
     LogPool();
 }
@@ -515,7 +905,7 @@ static bool PerformSwap(CVehicle* veh, int target)
 
 static void OnSwap()
 {
-    EnsureConfig();
+    if (!ConfigOk("TUKAR")) return;
 
     CVehicle* veh = FindPlayerVehicle(-1, false);
     if (!veh)
@@ -523,9 +913,10 @@ static void OnSwap()
         Log("TUKAR: kamu tidak sedang di dalam kendaraan.");
         return;
     }
-    if (g_modelCount == 0)
+    int modelCount = (int)g_modelCount;
+    if (modelCount == 0)
     {
-        Log("TUKAR: daftar Models= di INI kosong. Isi dulu, contoh: Models=infernus");
+        Log("TUKAR: belum ada model custom yang siap (isi Models= di INI, atau tunggu / cek unduhan dari BaseUrl).");
         return;
     }
     if (g_donorCount == 0)
@@ -545,7 +936,7 @@ static void OnSwap()
     int original = (e >= 0) ? g_swaps[e].original : current;
     int nextIdx = (e >= 0) ? g_swaps[e].modelIdx + 1 : 0;
 
-    if (nextIdx >= g_modelCount)
+    if (nextIdx >= modelCount)
     {
         // putaran habis -> kembalikan ke model asli
         Log("TUKAR: KEMBALIKAN ke model asli %d", original);
@@ -554,7 +945,7 @@ static void OnSwap()
         return;
     }
 
-    Log("TUKAR: model custom #%d '%s' (model asli kendaraan = %d)", nextIdx, g_models[nextIdx], original);
+    Log("TUKAR: model custom #%d '%s' (model asli kendaraan = %d)", nextIdx, g_models[nextIdx].name, original);
     int slotIdx = AcquireDonorFor(nextIdx);
     if (slotIdx < 0)
     {
@@ -701,16 +1092,30 @@ static DWORD WINAPI KeyThread(LPVOID)
     return 0;
 }
 
+// Thread kerja: baca konfigurasi lalu (kalau BaseUrl diisi) unduh manifest + model ke cache.
+// Berjalan terpisah dari thread game supaya unduhan tidak membuat game patah-patah.
+static DWORD WINAPI WorkerThread(LPVOID)
+{
+    EnsureConfig();
+#if CV_ENABLE_DOWNLOAD
+    if (g_baseUrl[0]) SyncRemote();
+#endif
+    return 0;
+}
+
 class CustomVehiclesPlugin
 {
 public:
     CustomVehiclesPlugin()
     {
-        Log("=== CustomVehicles (B1c: kolam donor; INSERT muat, F10 baca, F11 tukar/siklus, F12 isolasi) ter-load ===");
+        Log("=== CustomVehicles (B2: kelas donor + unduh; INSERT muat, F10 baca, F11 tukar/siklus, F12 isolasi) ter-load ===");
         plugin::Events::gameProcessEvent.before += OnGameProcess;
         plugin::Events::drawingEvent += OnDrawing;
 
         HANDLE h = CreateThread(NULL, 0, KeyThread, NULL, 0, NULL);
         if (h) CloseHandle(h);
+
+        HANDLE w = CreateThread(NULL, 0, WorkerThread, NULL, 0, NULL);
+        if (w) CloseHandle(w);
     }
 } g_customVehiclesPlugin;
